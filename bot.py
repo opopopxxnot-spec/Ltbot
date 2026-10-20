@@ -99,17 +99,45 @@ def strip_markdown_fences(text: str) -> str:
 
 
 def call_nvidia_ai(prompt: str) -> str:
-    """Calls NVIDIA NIM API (Llama 3.3 70B / DeepSeek R1) as secondary AI fallback."""
+    """Calls NVIDIA NIM API with dynamic model discovery as secondary AI fallback."""
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
     }
-    models = [
-        "meta/llama-3.3-70b-instruct",
-        "deepseek-ai/deepseek-r1",
-        "nvidia/llama-3.1-nemotron-70b-instruct",
-    ]
-    for model_name in models:
+
+    # 1. Dynamically query available active models on this NVIDIA account
+    active_models = []
+    try:
+        resp = requests.get(
+            "https://integrate.api.nvidia.com/v1/models",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            all_ids = [m["id"] for m in data if "id" in m]
+            # Prioritize top coding / reasoning models first
+            coder_models = [m for m in all_ids if "coder" in m.lower() or "deepseek" in m.lower()]
+            llama_models = [m for m in all_ids if "llama" in m.lower() and "instruct" in m.lower()]
+            other_instruct = [m for m in all_ids if "instruct" in m.lower()]
+            active_models = coder_models + llama_models + other_instruct
+            # Remove duplicates preserving order
+            seen = set()
+            active_models = [m for m in active_models if not (m in seen or seen.add(m))]
+            print(f"  📋 Found {len(active_models)} compatible active NVIDIA models.")
+    except Exception as e:
+        print(f"  ⚠️ Could not fetch NVIDIA models list: {e}")
+
+    # Fallback candidates if model list endpoint fails
+    if not active_models:
+        active_models = [
+            "qwen/qwen2.5-coder-32b-instruct",
+            "meta/llama-3.1-70b-instruct",
+            "meta/llama-3.1-8b-instruct",
+            "mistralai/mistral-large-2-instruct",
+        ]
+
+    for model_name in active_models[:5]:  # Try top 5 available models
         try:
             print(f"  🟢 Calling NVIDIA AI ({model_name})...")
             resp = requests.post(
@@ -127,7 +155,7 @@ def call_nvidia_ai(prompt: str) -> str:
                 content = resp.json()["choices"][0]["message"]["content"]
                 return strip_markdown_fences(content)
             else:
-                print(f"  ⚠️ NVIDIA model {model_name} returned {resp.status_code}: {resp.text[:150]}")
+                print(f"  ⚠️ NVIDIA model {model_name} returned {resp.status_code}")
         except Exception as e:
             print(f"  ⚠️ NVIDIA model {model_name} error: {e}")
     raise RuntimeError("All NVIDIA AI models failed.")
@@ -306,7 +334,11 @@ if __name__ == "__main__":
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\n--- Attempt {attempt}/{MAX_ATTEMPTS} ---")
-        code = generate_solution(problem, TARGET_LANG, feedback)
+        try:
+            code = generate_solution(problem, TARGET_LANG, feedback)
+        except Exception as e:
+            print(f"  ❌ AI generation failed: {e}")
+            break
         result = submit_and_poll(client, slug, problem["questionId"], TARGET_LANG, code)
         status = result.get("status_msg", "Unknown Error")
 
