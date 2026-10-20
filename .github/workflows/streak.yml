@@ -10,6 +10,8 @@ jobs:
   solve-daily:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -33,13 +35,13 @@ jobs:
           TARGET_LANG: "cpp"
         run: python bot.py
 
-      - name: Auto-commit streak log
+      - name: Auto-commit streak log and solutions
         run: |
           git config user.name "leetcode-bot"
           git config user.email "bot@streak.dev"
           DATE=$(date -u +"%Y-%m-%d")
           mkdir -p logs
           echo "✅ Daily challenge attempted on $DATE" >> logs/streak.log
-          git add logs/streak.log
+          git add logs/ solutions/
           git diff --cached --quiet || git commit -m "🔥 streak: $DATE daily challenge"
           git push

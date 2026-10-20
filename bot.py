@@ -161,13 +161,34 @@ def submit_and_poll(session, title_slug: str, question_id: str, lang_slug: str, 
     return {"status_msg": "Polling Timeout"}
 
 
+def save_solution(slug: str, title: str, difficulty: str, lang: str, code: str, runtime: str = "N/A", percentile: float = 0.0):
+    """Saves the solved problem and code locally for GitHub commit."""
+    folder = os.path.join("solutions", slug)
+    os.makedirs(folder, exist_ok=True)
+    ext_map = {"cpp": "cpp", "java": "java", "python3": "py"}
+    ext = ext_map.get(lang, lang)
+
+    code_path = os.path.join(folder, f"solution.{ext}")
+    with open(code_path, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    readme_path = os.path.join(folder, "README.md")
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(f"# {title} ({difficulty})\n\n")
+        f.write(f"- **Problem URL:** https://leetcode.com/problems/{slug}/\n")
+        f.write(f"- **Language:** {lang.upper()}\n")
+        f.write(f"- **Runtime:** {runtime} (Beats {percentile}%)\n")
+        f.write(f"- **Date:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n")
+        f.write(f"```{lang}\n{code}\n```\n")
+    print(f"  💾 Solution saved to {code_path}")
+
+
 # ──────────────────────────────────────────────
 # Fallback — Two Sum (guaranteed AC to save streak)
 # ──────────────────────────────────────────────
 def submit_fallback_two_sum(session):
     """Guaranteed fallback if the AI fails all attempts on the daily problem."""
-    cpp_code = """
-class Solution {
+    cpp_code = """class Solution {
 public:
     vector<int> twoSum(vector<int>& nums, int target) {
         unordered_map<int, int> mp;
@@ -177,9 +198,10 @@ public:
         }
         return {};
     }
-};
-"""
-    submit_and_poll(session, "two-sum", "1", "cpp", cpp_code)
+};"""
+    result = submit_and_poll(session, "two-sum", "1", "cpp", cpp_code)
+    save_solution("two-sum", "Two Sum", "Easy", "cpp", cpp_code, result.get("status_runtime", "N/A"), round(result.get("runtime_percentile", 0), 1))
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -220,6 +242,7 @@ if __name__ == "__main__":
         if status == "Accepted":
             runtime = result.get("status_runtime", "N/A")
             percentile = round(result.get("runtime_percentile", 0), 1)
+            save_solution(slug, problem['title'], problem['difficulty'], TARGET_LANG, code, runtime, percentile)
             notify(
                 f"✅ **Daily Challenge Solved!**\n"
                 f"**Problem:** {problem['title']} ({problem['difficulty']})\n"
