@@ -13,6 +13,7 @@ USERNAME = os.getenv("LC_USERNAME")
 LEETCODE_SESSION = os.getenv("LEETCODE_SESSION")
 CSRF_TOKEN = os.getenv("CSRF_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
 # Choose "cpp" or "java"
@@ -97,10 +98,43 @@ def strip_markdown_fences(text: str) -> str:
     return match.group(1).strip() if match else text
 
 
-def generate_solution(problem: dict, lang_slug: str, error_feedback: str = "") -> str:
-    """Calls Gemini to generate or fix a C++ / Java solution."""
-    client = genai.Client(api_key=GEMINI_API_KEY)
+def call_nvidia_ai(prompt: str) -> str:
+    """Calls NVIDIA NIM API (Llama 3.3 70B / DeepSeek R1) as secondary AI fallback."""
+    headers = {
+        "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    models = [
+        "meta/llama-3.3-70b-instruct",
+        "deepseek-ai/deepseek-r1",
+        "nvidia/llama-3.1-nemotron-70b-instruct",
+    ]
+    for model_name in models:
+        try:
+            print(f"  🟢 Calling NVIDIA AI ({model_name})...")
+            resp = requests.post(
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                    "max_tokens": 4096,
+                },
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                content = resp.json()["choices"][0]["message"]["content"]
+                return strip_markdown_fences(content)
+            else:
+                print(f"  ⚠️ NVIDIA model {model_name} returned {resp.status_code}: {resp.text[:150]}")
+        except Exception as e:
+            print(f"  ⚠️ NVIDIA model {model_name} error: {e}")
+    raise RuntimeError("All NVIDIA AI models failed.")
 
+
+def generate_solution(problem: dict, lang_slug: str, error_feedback: str = "") -> str:
+    """Generates solution using Gemini (primary) with automatic NVIDIA AI fallback."""
     # Extract the exact starter template for C++ or Java
     starter_code = next(
         (s["code"] for s in problem["codeSnippets"] if s["langSlug"] == lang_slug),
@@ -124,29 +158,35 @@ Requirements:
     if error_feedback:
         prompt += f"\nYour previous submission failed with the following judge feedback. Fix the bug or optimize the algorithm:\n{error_feedback}\n"
 
-    # gemini-3.8-flash is the only current model; retry on 503 (high demand) with backoff
-    MODEL = "gemini-3.8-flash"
-    MAX_MODEL_RETRIES = 5
-    last_err = None
-    for attempt_n in range(1, MAX_MODEL_RETRIES + 1):
-        try:
-            print(f"  🤖 Calling {MODEL} (attempt {attempt_n}/{MAX_MODEL_RETRIES})...")
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=prompt,
-            )
-            return strip_markdown_fences(response.text)
-        except Exception as e:
-            err_str = str(e)
-            last_err = e
-            if "503" in err_str or "UNAVAILABLE" in err_str:
-                wait = 15 * (2 ** (attempt_n - 1))  # 15s, 30s, 60s, 120s, 240s
-                print(f"  ⏳ {MODEL} is busy (503). Waiting {wait}s before retry...")
-                time.sleep(wait)
-            else:
-                # Hard error (404, auth, etc.) — no point retrying
-                raise RuntimeError(f"Gemini API error: {e}")
-    raise RuntimeError(f"Gemini {MODEL} returned 503 after {MAX_MODEL_RETRIES} retries. Last: {last_err}")
+    # Option 1: Try Gemini if key is provided
+    if GEMINI_API_KEY:
+        MODEL = "gemini-3.8-flash"
+        MAX_MODEL_RETRIES = 3
+        for attempt_n in range(1, MAX_MODEL_RETRIES + 1):
+            try:
+                print(f"  🤖 Calling Gemini ({MODEL}) (attempt {attempt_n}/{MAX_MODEL_RETRIES})...")
+                client = genai.Client(api_key=GEMINI_API_KEY)
+                response = client.models.generate_content(
+                    model=MODEL,
+                    contents=prompt,
+                )
+                return strip_markdown_fences(response.text)
+            except Exception as e:
+                err_str = str(e)
+                print(f"  ⚠️ Gemini failed: {e}")
+                if ("503" in err_str or "UNAVAILABLE" in err_str) and attempt_n < MAX_MODEL_RETRIES:
+                    wait = 10 * attempt_n
+                    print(f"  ⏳ Waiting {wait}s for Gemini...")
+                    time.sleep(wait)
+                elif NVIDIA_API_KEY:
+                    print("  🔄 Switching over to NVIDIA AI...")
+                    break
+
+    # Option 2: NVIDIA NIM API fallback
+    if NVIDIA_API_KEY:
+        return call_nvidia_ai(prompt)
+
+    raise RuntimeError("No AI provider succeeded. Check your GEMINI_API_KEY or NVIDIA_API_KEY.")
 
 
 # ──────────────────────────────────────────────
@@ -238,7 +278,9 @@ def notify(msg: str):
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     # Validate required secrets are present
-    missing = [v for v in ["LEETCODE_SESSION", "CSRF_TOKEN", "GEMINI_API_KEY"] if not os.getenv(v)]
+    missing = [v for v in ["LEETCODE_SESSION", "CSRF_TOKEN"] if not os.getenv(v)]
+    if not (os.getenv("GEMINI_API_KEY") or os.getenv("NVIDIA_API_KEY")):
+        missing.append("GEMINI_API_KEY or NVIDIA_API_KEY")
     if missing:
         print(f"❌ Missing required environment variables: {', '.join(missing)}")
         print("   Set them as GitHub Actions secrets (Settings → Secrets → Actions).")
