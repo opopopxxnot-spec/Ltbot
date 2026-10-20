@@ -124,21 +124,29 @@ Requirements:
     if error_feedback:
         prompt += f"\nYour previous submission failed with the following judge feedback. Fix the bug or optimize the algorithm:\n{error_feedback}\n"
 
-    # Try models in order until one works
-    models_to_try = ["gemini-3.8-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    # gemini-3.8-flash is the only current model; retry on 503 (high demand) with backoff
+    MODEL = "gemini-3.8-flash"
+    MAX_MODEL_RETRIES = 5
     last_err = None
-    for model_name in models_to_try:
+    for attempt_n in range(1, MAX_MODEL_RETRIES + 1):
         try:
-            print(f"  🤖 Trying model: {model_name}")
+            print(f"  🤖 Calling {MODEL} (attempt {attempt_n}/{MAX_MODEL_RETRIES})...")
             response = client.models.generate_content(
-                model=model_name,
+                model=MODEL,
                 contents=prompt,
             )
             return strip_markdown_fences(response.text)
         except Exception as e:
-            print(f"  ⚠️ Model {model_name} failed: {e}")
+            err_str = str(e)
             last_err = e
-    raise RuntimeError(f"All Gemini models failed. Last error: {last_err}")
+            if "503" in err_str or "UNAVAILABLE" in err_str:
+                wait = 15 * (2 ** (attempt_n - 1))  # 15s, 30s, 60s, 120s, 240s
+                print(f"  ⏳ {MODEL} is busy (503). Waiting {wait}s before retry...")
+                time.sleep(wait)
+            else:
+                # Hard error (404, auth, etc.) — no point retrying
+                raise RuntimeError(f"Gemini API error: {e}")
+    raise RuntimeError(f"Gemini {MODEL} returned 503 after {MAX_MODEL_RETRIES} retries. Last: {last_err}")
 
 
 # ──────────────────────────────────────────────
