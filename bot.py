@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from curl_cffi import requests
@@ -123,11 +124,21 @@ Requirements:
     if error_feedback:
         prompt += f"\nYour previous submission failed with the following judge feedback. Fix the bug or optimize the algorithm:\n{error_feedback}\n"
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-    )
-    return strip_markdown_fences(response.text)
+    # Try models in order until one works
+    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    last_err = None
+    for model_name in models_to_try:
+        try:
+            print(f"  🤖 Trying model: {model_name}")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            return strip_markdown_fences(response.text)
+        except Exception as e:
+            print(f"  ⚠️ Model {model_name} failed: {e}")
+            last_err = e
+    raise RuntimeError(f"All Gemini models failed. Last error: {last_err}")
 
 
 # ──────────────────────────────────────────────
@@ -218,8 +229,18 @@ def notify(msg: str):
 # Main entry-point
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
+    # Validate required secrets are present
+    missing = [v for v in ["LEETCODE_SESSION", "CSRF_TOKEN", "GEMINI_API_KEY"] if not os.getenv(v)]
+    if missing:
+        print(f"❌ Missing required environment variables: {', '.join(missing)}")
+        print("   Set them as GitHub Actions secrets (Settings → Secrets → Actions).")
+        sys.exit(1)
+
     client = get_session()
+
+    print("🔍 Fetching today's Daily Challenge...")
     daily = get_daily_slug(client)
+    print(f"   Date: {daily.get('date')} | Status: {daily.get('userStatus')}")
 
     # userStatus == "Finish" means today's daily coin is already earned
     if daily.get("userStatus") == "Finish":
