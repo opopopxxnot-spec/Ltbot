@@ -1,0 +1,45 @@
+name: LeetCode Daily Streak Bot
+
+on:
+  schedule:
+    # Runs every day at 00:30 UTC (06:00 IST) — right after LeetCode's daily reset
+    - cron: "30 0 * * *"
+  workflow_dispatch: # Allow manual trigger from GitHub UI
+
+jobs:
+  solve-daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install curl_cffi google-genai
+
+      - name: Run Auto-Solver Bot
+        env:
+          LC_USERNAME: ${{ secrets.LC_USERNAME }}
+          LEETCODE_SESSION: ${{ secrets.LEETCODE_SESSION }}
+          CSRF_TOKEN: ${{ secrets.CSRF_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          TARGET_LANG: "cpp"
+        run: python bot.py
+
+      - name: Auto-commit streak log
+        run: |
+          git config user.name "leetcode-bot"
+          git config user.email "bot@streak.dev"
+          DATE=$(date -u +"%Y-%m-%d")
+          mkdir -p logs
+          echo "✅ Daily challenge attempted on $DATE" >> logs/streak.log
+          git add logs/streak.log
+          git diff --cached --quiet || git commit -m "🔥 streak: $DATE daily challenge"
+          git push
