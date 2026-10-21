@@ -24,19 +24,80 @@ GRAPHQL_URL = "https://leetcode.com/graphql"
 
 
 # ──────────────────────────────────────────────
-# Session
+# Session & Anti-Bot Protection
 # ──────────────────────────────────────────────
-def get_session():
-    """Creates an authenticated LeetCode session using browser impersonation."""
-    session = requests.Session(impersonate="chrome120")
+BROWSER_PROFILES = ["chrome124", "chrome", "safari17_0", "chrome131"]
+
+
+def get_session(impersonate_target: str = "chrome124") -> requests.Session:
+    """Creates an authenticated LeetCode session with realistic browser headers."""
+    session = requests.Session(impersonate=impersonate_target)
+    csrf = CSRF_TOKEN or ""
     session.headers.update({
         "Content-Type": "application/json",
+        "Origin": "https://leetcode.com",
         "Referer": "https://leetcode.com/",
-        "x-csrftoken": CSRF_TOKEN or "",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "x-csrftoken": csrf,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     })
-    session.cookies.set("LEETCODE_SESSION", LEETCODE_SESSION, domain=".leetcode.com")
-    session.cookies.set("csrftoken", CSRF_TOKEN, domain=".leetcode.com")
+    if LEETCODE_SESSION:
+        session.cookies.set("LEETCODE_SESSION", LEETCODE_SESSION, domain=".leetcode.com")
+    if csrf:
+        session.cookies.set("csrftoken", csrf, domain=".leetcode.com")
     return session
+
+
+def sync_csrf(session: requests.Session) -> str:
+    """Keeps x-csrftoken header and csrftoken cookie in sync to prevent 403 CSRF rejections."""
+    token = session.cookies.get("csrftoken") or CSRF_TOKEN or ""
+    if token:
+        session.headers["x-csrftoken"] = token
+        session.cookies.set("csrftoken", token, domain=".leetcode.com")
+    return token
+
+
+def check_auth(session: requests.Session) -> tuple[bool, str]:
+    """Validates whether LEETCODE_SESSION is active and signed in."""
+    query = """
+    query globalData {
+      userStatus {
+        isSignedIn
+        username
+      }
+    }
+    """
+    try:
+        sync_csrf(session)
+        resp = session.post(GRAPHQL_URL, json={"query": query}, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json().get("data", {}).get("userStatus", {})
+            return bool(data.get("isSignedIn", False)), str(data.get("username", ""))
+    except Exception as e:
+        print(f"  ⚠️ Auth check error: {e}")
+    return False, ""
+
+
+def warm_up_problem_page(session: requests.Session, title_slug: str):
+    """Visits the problem page to populate session cookies and establish normal navigation history."""
+    url = f"https://leetcode.com/problems/{title_slug}/"
+    try:
+        session.get(
+            url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            timeout=15,
+        )
+        sync_csrf(session)
+    except Exception as e:
+        print(f"  ⚠️ Problem page warm-up warning: {e}")
 
 
 # ──────────────────────────────────────────────
@@ -59,7 +120,8 @@ def get_daily_slug(session) -> dict:
       }
     }
     """
-    resp = session.post(GRAPHQL_URL, json={"query": query})
+    sync_csrf(session)
+    resp = session.post(GRAPHQL_URL, json={"query": query}, timeout=15)
     return resp.json()["data"]["activeDailyCodingChallengeQuestion"]
 
 
@@ -81,10 +143,11 @@ def get_problem_details(session, title_slug: str) -> dict:
       }
     }
     """
+    sync_csrf(session)
     resp = session.post(GRAPHQL_URL, json={
         "query": query,
         "variables": {"titleSlug": title_slug}
-    })
+    }, timeout=15)
     return resp.json()["data"]["question"]
 
 
@@ -218,32 +281,169 @@ Requirements:
 
 
 # ──────────────────────────────────────────────
-# LeetCode submit + poll
+# LeetCode submit + poll with Cloudflare Resiliency
 # ──────────────────────────────────────────────
+def submit_with_playwright(slug: str, question_id: str, lang_slug: str, code: str) -> dict:
+    """Uses a headless Chromium instance via Playwright to bypass Cloudflare Turnstile/JS challenge."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("Playwright is not installed in the current environment.")
+
+    print("  🛡️ Launching Playwright Chromium to bypass Cloudflare challenge...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+        context.add_cookies([
+            {"name": "LEETCODE_SESSION", "value": LEETCODE_SESSION or "", "domain": ".leetcode.com", "path": "/"},
+            {"name": "csrftoken", "value": CSRF_TOKEN or "", "domain": ".leetcode.com", "path": "/"},
+        ])
+        page = context.new_page()
+        page_url = f"https://leetcode.com/problems/{slug}/"
+        print(f"  Navigating to {page_url}...")
+        page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(4000)
+
+        # Retrieve any refreshed csrftoken from context cookies
+        cookies = context.cookies()
+        csrf_val = next((c["value"] for c in cookies if c["name"] == "csrftoken"), CSRF_TOKEN or "")
+
+        print("  Executing submission fetch inside browser session...")
+        js_submit = """
+        async ({ slug, csrf, lang, question_id, code }) => {
+            const res = await fetch(`https://leetcode.com/problems/${slug}/submit/`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Origin': 'https://leetcode.com',
+                    'Referer': `https://leetcode.com/problems/${slug}/`,
+                    'x-csrftoken': csrf
+                },
+                body: JSON.stringify({
+                    lang: lang,
+                    question_id: String(question_id),
+                    typed_code: code
+                })
+            });
+            const text = await res.text();
+            try {
+                return { status: res.status, json: JSON.parse(text) };
+            } catch(e) {
+                return { status: res.status, text: text };
+            }
+        }
+        """
+        eval_res = page.evaluate(js_submit, {
+            "slug": slug,
+            "csrf": csrf_val,
+            "lang": lang_slug,
+            "question_id": str(question_id),
+            "code": code,
+        })
+        browser.close()
+
+        status = eval_res.get("status")
+        if status == 200 and "json" in eval_res and "submission_id" in eval_res["json"]:
+            return eval_res["json"]
+        raise RuntimeError(f"Playwright submission returned HTTP {status}: {eval_res.get('text', eval_res.get('json'))}")
+
+
 def submit_and_poll(session, title_slug: str, question_id: str, lang_slug: str, code: str) -> dict:
-    """Submits code to LeetCode and polls until the judge finishes grading."""
+    """Submits code to LeetCode and polls until the judge finishes grading.
+    Handles Cloudflare challenges via browser profile rotation, warm-ups, and Playwright fallback."""
     submit_url = f"https://leetcode.com/problems/{title_slug}/submit/"
-    session.headers.update({"Referer": f"https://leetcode.com/problems/{title_slug}/"})
 
     payload = {
         "lang": lang_slug,
         "question_id": str(question_id),
         "typed_code": code,
     }
-    resp = session.post(submit_url, json=payload)
-    if resp.status_code != 200 or "submission_id" not in resp.json():
-        raise RuntimeError(f"Submission rejected ({resp.status_code}): {resp.text}")
 
-    submission_id = resp.json()["submission_id"]
+    submission_id = None
+    last_error = ""
+
+    # Tier 1: Try curl_cffi with rotating browser profiles
+    for attempt_idx, profile in enumerate(BROWSER_PROFILES, 1):
+        try:
+            print(f"  📤 Submitting code (profile: {profile}, attempt {attempt_idx}/{len(BROWSER_PROFILES)})...")
+            curr_session = session if attempt_idx == 1 else get_session(impersonate_target=profile)
+            warm_up_problem_page(curr_session, title_slug)
+            csrf = sync_csrf(curr_session)
+
+            submit_headers = {
+                "Content-Type": "application/json",
+                "Origin": "https://leetcode.com",
+                "Referer": f"https://leetcode.com/problems/{title_slug}/",
+                "Accept": "*/*",
+                "x-csrftoken": csrf,
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+                "Upgrade-Insecure-Requests": None,
+                "Sec-Fetch-User": None,
+            }
+
+            resp = curr_session.post(submit_url, json=payload, headers=submit_headers, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "submission_id" in data:
+                    submission_id = data["submission_id"]
+                    session = curr_session
+                    break
+                else:
+                    last_error = f"200 OK without submission_id: {resp.text[:200]}"
+            elif resp.status_code == 403:
+                last_error = "403 Forbidden (Cloudflare WAF / Auth challenge)"
+                print(f"  ⚠️ Profile {profile} hit Cloudflare 403. Retrying with next profile in 4s...")
+                time.sleep(4)
+            elif resp.status_code == 429:
+                last_error = "429 Rate limited"
+                print("  ⚠️ Rate limited. Waiting 12s...")
+                time.sleep(12)
+            else:
+                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                time.sleep(3)
+        except Exception as e:
+            last_error = str(e)
+            print(f"  ⚠️ Error submitting with {profile}: {e}")
+            time.sleep(3)
+
+    # Tier 2: If curl_cffi was blocked by Cloudflare (403), fallback to Playwright headless browser
+    if not submission_id:
+        print("  ⚠️ curl_cffi was blocked by Cloudflare across all profiles. Attempting Playwright fallback...")
+        try:
+            pw_data = submit_with_playwright(title_slug, question_id, lang_slug, code)
+            submission_id = pw_data.get("submission_id")
+        except Exception as pw_err:
+            print(f"  ❌ Playwright fallback error: {pw_err}")
+            raise RuntimeError(f"Submission rejected ({last_error} | Playwright: {pw_err})")
+
+    if not submission_id:
+        raise RuntimeError(f"Submission rejected: {last_error}")
+
     print(f"  Submitted! Polling Submission ID: {submission_id}...")
 
     # Poll /submissions/detail/<id>/check/ every 3 seconds
     check_url = f"https://leetcode.com/submissions/detail/{submission_id}/check/"
-    for _ in range(20):
+    sync_csrf(session)
+    for _ in range(25):
         time.sleep(3)
-        check_resp = session.get(check_url).json()
-        if check_resp.get("state") == "SUCCESS":
-            return check_resp
+        try:
+            check_resp = session.get(check_url, timeout=15).json()
+            if check_resp.get("state") == "SUCCESS":
+                return check_resp
+        except Exception as e:
+            print(f"  ⚠️ Polling transient error: {e}")
 
     return {"status_msg": "Polling Timeout"}
 
@@ -275,6 +475,7 @@ def save_solution(slug: str, title: str, difficulty: str, lang: str, code: str, 
 # ──────────────────────────────────────────────
 def submit_fallback_two_sum(session):
     """Guaranteed fallback if the AI fails all attempts on the daily problem."""
+    print("🚑 Attempting Two Sum fallback to protect streak...")
     cpp_code = """class Solution {
 public:
     vector<int> twoSum(vector<int>& nums, int target) {
@@ -286,9 +487,13 @@ public:
         return {};
     }
 };"""
-    result = submit_and_poll(session, "two-sum", "1", "cpp", cpp_code)
-    save_solution("two-sum", "Two Sum", "Easy", "cpp", cpp_code, result.get("status_runtime", "N/A"), round(result.get("runtime_percentile", 0), 1))
-    return result
+    try:
+        result = submit_and_poll(session, "two-sum", "1", "cpp", cpp_code)
+        save_solution("two-sum", "Two Sum", "Easy", "cpp", cpp_code, result.get("status_runtime", "N/A"), round(result.get("runtime_percentile", 0), 1))
+        return result
+    except Exception as e:
+        print(f"  ❌ Two Sum fallback failed: {e}")
+        return {"status_msg": f"Fallback Failed: {e}"}
 
 
 # ──────────────────────────────────────────────
@@ -298,7 +503,10 @@ def notify(msg: str):
     """Prints to stdout (visible in Actions logs) and optionally pings Discord."""
     print(msg)
     if DISCORD_WEBHOOK:
-        requests.post(DISCORD_WEBHOOK, json={"content": msg})
+        try:
+            requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=10)
+        except Exception as e:
+            print(f"⚠️ Discord notification error: {e}")
 
 
 # ──────────────────────────────────────────────
@@ -316,6 +524,22 @@ if __name__ == "__main__":
 
     client = get_session()
 
+    # Verify session authentication upfront
+    print("🔐 Checking LeetCode authentication...")
+    is_signed_in, current_user = check_auth(client)
+    if not is_signed_in:
+        print("⚠️ WARNING: Your LEETCODE_SESSION is invalid or has expired!")
+        print("   LeetCode returns isSignedIn=False. Submissions will likely be rejected with 403.")
+        print("   👉 To fix: Log into leetcode.com, copy fresh 'LEETCODE_SESSION' and 'csrftoken' cookies,")
+        print("      and update them in your GitHub repo: Settings → Secrets and variables → Actions.")
+        notify(
+            "⚠️ **LeetCode Session Alert**\n"
+            "Your `LEETCODE_SESSION` cookie appears to be expired or invalid (not signed in).\n"
+            "Please copy fresh cookies from your browser and update GitHub Secrets."
+        )
+    else:
+        print(f"   👤 Logged in as: {current_user}")
+
     print("🔍 Fetching today's Daily Challenge...")
     daily = get_daily_slug(client)
     print(f"   Date: {daily.get('date')} | Status: {daily.get('userStatus')}")
@@ -323,7 +547,7 @@ if __name__ == "__main__":
     # userStatus == "Finish" means today's daily coin is already earned
     if daily.get("userStatus") == "Finish":
         print("✅ Today's Daily Challenge is already completed!")
-        exit(0)
+        sys.exit(0)
 
     slug = daily["question"]["titleSlug"]
     problem = get_problem_details(client, slug)
@@ -339,7 +563,17 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  ❌ AI generation failed: {e}")
             break
-        result = submit_and_poll(client, slug, problem["questionId"], TARGET_LANG, code)
+
+        try:
+            result = submit_and_poll(client, slug, problem["questionId"], TARGET_LANG, code)
+        except Exception as e:
+            print(f"  ❌ Attempt {attempt} submission failed: {e}")
+            feedback = f"Submission error: {e}"
+            if attempt < MAX_ATTEMPTS:
+                print("  ⏳ Waiting 15s before next attempt...")
+                time.sleep(15)
+            continue
+
         status = result.get("status_msg", "Unknown Error")
 
         if status == "Accepted":
@@ -373,4 +607,9 @@ if __name__ == "__main__":
             f"⚠️ AI failed to solve **{problem['title']}** after {MAX_ATTEMPTS} tries. "
             f"Submitting Two Sum fallback to save streak."
         )
-        submit_fallback_two_sum(client)
+        try:
+            submit_fallback_two_sum(client)
+        except Exception as e:
+            print(f"❌ Fallback Two Sum also failed: {e}")
+            notify(f"❌ Fallback Two Sum also failed: {e}")
+

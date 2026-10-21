@@ -23,7 +23,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install curl_cffi google-genai
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
 
       - name: Run Auto-Solver Bot
         env:
