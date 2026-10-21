@@ -2,14 +2,24 @@ name: LeetCode Daily Streak Bot
 
 on:
   schedule:
-    # Runs every day at 00:30 UTC (06:00 IST) — right after LeetCode's daily reset
-    - cron: "30 0 * * *"
+    # Multi-schedule redundancy (Primary + 2 automatic fallback passes if earlier runs hit network issues)
+    - cron: "30 0 * * *"   # 00:30 UTC (06:00 IST) — Primary run right after daily reset
+    - cron: "30 6 * * *"   # 06:30 UTC (12:00 IST) — Afternoon safety check
+    - cron: "30 14 * * *"  # 14:30 UTC (20:00 IST) — Evening emergency pass before day ends
+  push:
+    paths:
+      - 'bot.py'
+      - '.github/workflows/**'
   workflow_dispatch: # Allow manual trigger from GitHub UI
+
+concurrency:
+  group: leetcode-streak-bot
+  cancel-in-progress: false
 
 jobs:
   solve-daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: write
 
@@ -27,7 +37,7 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Run Auto-Solver Bot
+      - name: Run Auto-Solver Bot (with auto-retry)
         env:
           LC_USERNAME: ${{ secrets.LC_USERNAME }}
           LEETCODE_SESSION: ${{ secrets.LEETCODE_SESSION }}
@@ -36,7 +46,21 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           TARGET_LANG: "cpp"
-        run: python bot.py
+        run: |
+          MAX_RUNS=2
+          for i in $(seq 1 $MAX_RUNS); do
+            echo "🚀 Bot Execution Attempt $i/$MAX_RUNS..."
+            if python bot.py; then
+              echo "✅ Bot finished successfully."
+              exit 0
+            fi
+            if [ $i -lt $MAX_RUNS ]; then
+              echo "⚠️ Run attempt $i encountered an issue. Waiting 30s before auto-retrying..."
+              sleep 30
+            fi
+          done
+          echo "❌ Bot failed all run attempts."
+          exit 1
 
       - name: Auto-commit streak log and solutions
         run: |
@@ -46,5 +70,8 @@ jobs:
           mkdir -p logs
           echo "✅ Daily challenge attempted on $DATE" >> logs/streak.log
           git add logs/ solutions/
-          git diff --cached --quiet || git commit -m "🔥 streak: $DATE daily challenge"
-          git push
+          if ! git diff --cached --quiet; then
+            git commit -m "🔥 streak: $DATE daily challenge"
+            git pull --rebase origin main || true
+            git push origin main
+          fi
