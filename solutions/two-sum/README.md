@@ -2,8 +2,8 @@
 
 - **Problem URL:** https://leetcode.com/problems/two-sum/
 - **Language:** CPP
-- **Runtime:** 1 ms (Beats 78.9%)
-- **Date:** 2026-10-21 19:29:06 UTC
+- **Runtime:** 3 ms (Beats 64.6%)
+- **Date:** 2026-11-03 07:18:21 UTC
 
 ```cpp
 class Solution {
